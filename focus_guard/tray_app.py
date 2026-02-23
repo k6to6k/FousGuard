@@ -53,8 +53,12 @@ def run_tray_app(state_controller: Any) -> None:
         icon.visible = True
 
     def on_emergency_exit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        # 占位：下一阶段接入 unlock_ui 子进程调用
-        print("[FocusGuard] 触发紧急退出，待接入 unlock_ui")
+        # 占位实现：当前版本直接关闭专注模式，停止拦截
+        # 后续阶段再替换为 unlock_ui 子进程 + 高阻力解锁逻辑
+        state_controller.set_active(False)
+        icon.icon = get_current_icon()
+        icon.visible = True
+        print("[FocusGuard] 紧急退出：已关闭专注模式（占位实现，待接入 unlock_ui）")
 
     def on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
         # 请求停止后台线程，并退出托盘

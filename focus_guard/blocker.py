@@ -92,28 +92,37 @@ def _ensure_rule_index(config: Dict[str, Any]) -> None:
     _CONFIG_FINGERPRINT = fingerprint
 
 
-def _match_rules(process_name: Optional[str], window_title: Optional[str]) -> bool:
+def _match_rules(process_name: Optional[str], window_title: Optional[str]) -> Tuple[bool, bool]:
     """
-    根据全局缓存的黑名单判断当前窗口是否违规。
+    根据全局缓存的黑名单判断当前窗口是否违规，并返回命中类型。
+    返回值:
+    - (matched_process, matched_title)
+        matched_process: 是否命中进程黑名单
+        matched_title: 是否命中标题关键字/正则
+
     要求在调用前确保 _ensure_rule_index 已被执行。
     """
     if _PROCESS_BLACKLIST_SET is None or _TITLE_PATTERNS is None:
-        return False
+        return (False, False)
 
     pn = (process_name or "").lower()
     wt = (window_title or "").lower()
 
+    matched_process = False
+    matched_title = False
+
     # 进程名精确匹配
     if pn and pn in _PROCESS_BLACKLIST_SET:
-        return True
+        matched_process = True
 
     # 窗口标题关键字/正则匹配
     if wt:
         for pattern in _TITLE_PATTERNS:
             if pattern.search(wt):
-                return True
+                matched_title = True
+                break
 
-    return False
+    return matched_process, matched_title
 
 
 def _kill_processes_by_name(process_name: str) -> None:
@@ -194,6 +203,28 @@ def _kill_process_by_pid(pid: Optional[int], process_name: Optional[str] = None)
         return False
 
 
+def _send_ctrl_w_to_foreground() -> None:
+    """
+    尝试向当前前台窗口发送 Ctrl+W 快捷键，以关闭当前标签页/文档，而非整个进程。
+    使用 Windows keybd_event，任何异常都会被吞掉以保证鲁棒性。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        VK_CONTROL = 0x11
+        VK_W = 0x57
+        KEYEVENTF_KEYUP = 0x0002
+
+        # Ctrl down + W down
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_W, 0, 0, 0)
+        # W up + Ctrl up
+        user32.keybd_event(VK_W, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        # 任何键盘模拟异常都不应影响主逻辑
+        return
+
+
 def enforce_rules(
     process_name: Optional[str],
     window_title: Optional[str],
@@ -201,7 +232,7 @@ def enforce_rules(
     config: Dict[str, Any],
 ) -> None:
     """
-    核心方法：根据配置判断当前前台窗口是否违规，若违规则结束对应进程。
+    核心方法：根据配置判断当前前台窗口是否违规，并按命中类型执行不同策略。
 
     参数：
     - process_name: 当前前台窗口的进程名（小写，可能为 None）
@@ -215,19 +246,36 @@ def enforce_rules(
     # 确保全局匹配索引已根据最新配置构建
     _ensure_rule_index(config)
 
-    if not _match_rules(process_name, window_title):
+    matched_process, matched_title = _match_rules(process_name, window_title)
+    if not matched_process and not matched_title:
         return
 
     print(
-        f"[FocusGuard] Block rule matched: process={process_name}, pid={pid}, title={window_title!r}"
+        f"[FocusGuard] Block rule matched: process={process_name}, pid={pid}, title={window_title!r}, "
+        f"by_process={matched_process}, by_title={matched_title}"
     )
 
-    # 优先尝试精准狙击：按 PID 结束当前窗口对应的单个进程
-    killed = _kill_process_by_pid(pid, process_name)
+    # 1. 若命中进程黑名单：强力阻断（kill 进程）
+    if matched_process:
+        killed = _kill_process_by_pid(pid, process_name)
+        if not killed:
+            _kill_processes_by_name(process_name or "")
+        return
 
-    # 若无法使用 PID（例如无 PID 信息），可退回到按进程名结束同名进程
-    if not killed and (pid is None or pid <= 0):
-        _kill_processes_by_name(process_name or "")
+    # 2. 仅命中标题黑名单（例如网页标题包含 bilibili）：
+    #    - 当前版本采取“温和阻断”：通过 Ctrl+W 尝试关闭当前活动标签页/文档，而不是直接杀掉整个浏览器进程。
+    #    - 同时弹出系统模态警告，文案优先展示网页标题信息而不是浏览器进程名。
+    if matched_title and not matched_process:
+        # 对于网页类拦截，更希望提示“哪个页面”而不是“哪个进程”
+        target_name = window_title or (process_name or "受限内容")
+        def _soft_block():
+            _send_ctrl_w_to_foreground()
+            show_block_warning(target_name)
+
+        threading.Thread(
+            target=_soft_block,
+            daemon=True,
+        ).start()
 
 
 if __name__ == "__main__":
