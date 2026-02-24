@@ -411,6 +411,15 @@
 - **开发专属扩展**：引入基于 Manifest V3 的浏览器扩展，利用 `chrome.tabs` 等 API 实时、精准地提取标签页上下文特征（完整 URL 与标题），彻底突破外部进程只能看到“浏览器窗口标题”的硬限制。
 - **大模型基座预留**：在扩展后台将采集到的特征序列化为统一的 JSON 结构，并预留向本地 Python 服务发起 HTTP 请求的能力，为后续引入大模型（LLM）进行“网页意图智能打分”（结合用户专注目标判断其是“学习辅助”还是“娱乐摸鱼”）奠定数据与架构基础。
 
-- **本地 HTTP 链路打通**：基于 Python 原生 `http.server` 实现轻量级本地微服务，将 `server.py` 作为浏览器扩展与主程序之间的“内存数据总线”，缓存扩展上报的标签页流；同时改造 `dashboard_ui.py`，通过 `/api/recent_tabs` 的 HTTP GET 接口跨进程拉取这些数据，彻底替代了之前充满局限的 Win32 窗口标题嗅探，真正实现“浏览器级所见即所得”的规则配置体验。
-- **雷达数据并入阻断引擎**：在本地服务中扩大标签页缓存容量（最多 100 条），并维护 `CURRENT_BROWSER_TAB` 表示最新的活动标签页；在 `main.py` 的监控循环中，当前台进程为浏览器（如 `chrome.exe`、`msedge.exe` 等）时，从 `server.py` 读出当前标签页的 `title/url`，以参数形式传入 `blocker.enforce_rules`；在 `blocker.py` 中，将标题黑名单匹配扩展到 `browser_title` 和 `browser_url`，并调整弹窗文案优先级为 `browser_title > window_title > process_name`，最终实现“浏览器扩展雷达 → 本地阻断引擎”的完整闭环。
+-- **本地 HTTP 链路打通**：基于 Python 原生 `http.server` 实现轻量级本地微服务，将 `server.py` 作为浏览器扩展与主程序之间的“内存数据总线”，缓存扩展上报的标签页流；同时改造 `dashboard_ui.py`，通过 `/api/recent_tabs` 的 HTTP GET 接口跨进程拉取这些数据，彻底替代了之前充满局限的 Win32 窗口标题嗅探，真正实现“浏览器级所见即所得”的规则配置体验。
+-- **雷达数据并入阻断引擎**：在本地服务中扩大标签页缓存容量（最多 100 条），并维护 `CURRENT_BROWSER_TAB` 表示最新的活动标签页；在 `main.py` 的监控循环中，当前台进程为浏览器（如 `chrome.exe`、`msedge.exe` 等）时，从 `server.py` 读出当前标签页的 `title/url`，以参数形式传入 `blocker.enforce_rules`；在 `blocker.py` 中，将标题黑名单匹配扩展到 `browser_title` 和 `browser_url`，并调整弹窗文案优先级为 `browser_title > window_title > process_name`，最终实现“浏览器扩展雷达 → 本地阻断引擎”的完整闭环。
 
+## 11. 阶段九：大模型意图打分与动态拦截
+
+- **架构升级（从静态黑名单到云端智能裁决）**：成功引入硅基流动托管的 `DeepSeek-V3` 模型，通过标准库 `urllib.request` 发起原生 HTTP 请求，实现了轻量级的 LLM 调用链路。相比传统依赖标题关键字的静态黑名单策略，新的架构能够结合“专注目标 + 网页标题 + URL”进行语义级判断，显著减少了“观看学习视频却被误杀”的反直觉场景。
+- **极其严苛的 Prompt 设计**：通过 System 角色明确约束大模型只能输出 `"ALLOW"` 或 `"BLOCK"` 两个单词，禁止任何额外字符与解释性文本，从而在工程层面获得高确定性的二分类结果，便于在阻断引擎中进行布尔决策与缓存。
+- **工程健壮性建设（防刷与兜底）**：
+  - **内存缓存机制**：在 `llm_classifier.py` 中引入 `_DECISION_CACHE` 字典，以“专注目标 | URL”作为键，对同一网页在同一专注目标下的判定结果进行本地缓存。监控循环每 1.5 秒触发时，如果命中缓存即可 0 毫秒返回，避免在用户长时间停留某一学习/娱乐页面时反复打满云端 API 配额。
+  - **显式超时与断网兜底**：为云端请求增加 15 秒超时限制，并通过 `try/except` 捕获包括超时在内的所有网络异常。任何请求失败、JSON 解析异常或结构异常都会统一默认返回“放行”（即视为无需拦截），确保在断网或云端拥堵的极端情况下，永远不会阻塞本地监控主线程，也不会因模型不可用而误杀正常网页访问。
+  - **跨进程专注目标对齐 Bug 修复**：在实践中发现控制中心 UI 虽然已将专注目标写入 `focus_log.txt`，但早期版本的 `dashboard_ui.py` 向主进程下发的 `focus_command.json` 仅包含 `minutes` 字段，导致主程序侧的 `FocusState.focus_target` 始终为空。现已在 `dashboard_ui.py` 中将用户输入的 `target_text` 一并写入 `{"minutes": X, "target": "..."}`，并在 `main.py` 读取时通过 `str(...).strip()` 做安全解析，保证 UI 端填写的专注目标能够在主循环与 LLM 裁决链路中被完整感知与使用。
+  - **SPA 标题加载宽限期 Bug 修复**：在实测 B 站等单页应用（SPA）时发现，点击视频瞬间扩展上报的 `browser_title` 只是 URL 片段（如 `bilibili.com/video/...`），缺乏语义，导致 LLM 在过渡期做出错误“BLOCK”判定并被缓存。为此在 `blocker.py` 的浏览器专属路径中引入“标题加载宽限期”：当尚无 URL，或当前标题只是 URL 的子串时（典型 SPA 路由过渡期），本轮一律放行并打印 `Browser title loading grace period` 日志，等待下一轮扩展上报完整的中文/语义标题后再交给 LLM 决策，从而避免对视频入口的瞬时误杀。

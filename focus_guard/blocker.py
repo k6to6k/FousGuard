@@ -18,6 +18,17 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import psutil
+import llm_classifier
+
+
+# 与 main.py 中保持一致：被视为“浏览器进程”的可执行文件名（小写）
+BROWSER_PROCESSES = {
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+}
 
 
 # 全局缓存：用于加速匹配（process_blacklist -> set, title_blacklist -> 预编译正则）
@@ -232,6 +243,7 @@ def enforce_rules(
     config: Dict[str, Any],
     browser_url: str = "",
     browser_title: str = "",
+    focus_target: str = "",
 ) -> None:
     """
     核心方法：根据配置判断当前前台窗口是否违规，并按命中类型执行不同策略。
@@ -243,6 +255,7 @@ def enforce_rules(
     - config: 从 config.json 读取的配置字典
     - browser_url: 来自浏览器扩展的当前标签页 URL（可能为空）
     - browser_title: 来自浏览器扩展的当前标签页标题（可能为空）
+    - focus_target: 当前专注目标文本（空字符串表示非专注状态或未设置目标）
     """
     if not process_name and not window_title:
         return
@@ -264,36 +277,106 @@ def enforce_rules(
 
     matched_title = matched_title_window or matched_title_browser
 
-    if not matched_process and not matched_title:
-        return
-
-    print(
-        f"[FocusGuard] Block rule matched: process={process_name}, pid={pid}, "
-        f"window_title={window_title!r}, browser_title={browser_title!r}, browser_url={browser_url!r}, "
-        f"by_process={matched_process}, by_title_window={matched_title_window}, by_title_browser={matched_title_browser}"
-    )
-
-    # 1. 若命中进程黑名单：强力阻断（kill 进程）
+    # 第一关：本地进程黑名单强力狙杀（永远最高优先级）
     if matched_process:
+        print(
+            f"[FocusGuard] Process blacklist hit: process={process_name}, pid={pid}, "
+            f"window_title={window_title!r}"
+        )
         killed = _kill_process_by_pid(pid, process_name)
         if not killed:
             _kill_processes_by_name(process_name or "")
         return
 
-    # 2. 仅命中标题黑名单（例如网页标题包含 bilibili）：
-    #    - 当前版本采取“温和阻断”：通过 Ctrl+W 尝试关闭当前活动标签页/文档，而不是直接杀掉整个浏览器进程。
-    #    - 同时弹出系统模态警告，文案优先展示网页标题信息而不是浏览器进程名。
-    if matched_title and not matched_process:
-        # 对于网页类拦截，更希望提示“哪个页面”而不是“哪个进程”
-        target_name = browser_title or window_title or (process_name or "受限内容")
-        def _soft_block():
-            _send_ctrl_w_to_foreground()
-            show_block_warning(target_name)
+    # 浏览器专属路径：在专注模式下，浏览器一律由 LLM 决策，静态标题规则完全失效
+    is_browser = bool(
+        process_name and process_name.lower() in BROWSER_PROCESSES
+    )
+    if is_browser and focus_target:
+        # 扩展还未上报任何 URL，或当前抓到的标题只是 URL 的一部分（典型 SPA 路由过渡期，标题尚未渲染出语义）
+        # 为避免在过渡期误杀，给予一轮加载宽限期，等待下一轮扩展上报真实中文/语义标题后再由 LLM 决策。
+        bt_lower = (browser_title or "").lower()
+        bu_lower = (browser_url or "").lower()
+        if (not browser_url) or (bt_lower and bt_lower in bu_lower):
+            print(
+                f"[FocusGuard] Browser title loading grace period: "
+                f"browser_title={browser_title!r}, url={browser_url!r}, focus_target={focus_target!r}"
+            )
+            return
 
-        threading.Thread(
-            target=_soft_block,
-            daemon=True,
-        ).start()
+        try:
+            is_block = llm_classifier.evaluate_webpage_intent(
+                focus_target,
+                browser_title or window_title or "",
+                browser_url,
+            )
+        except Exception as exc:
+            # LLM 调用任何异常都不影响后续逻辑；浏览器在专注模式下若无法得到明确裁决，则选择放行
+            print(f"[FocusGuard] LLM evaluation error for browser, allow by default: {exc}")
+            return
+
+        if is_block:
+            # AI 判定为偏离目标 → 软阻断并优先返回
+            target_name = browser_title or window_title or (process_name or "受限内容")
+
+            def _ai_soft_block() -> None:
+                _send_ctrl_w_to_foreground()
+                try:
+                    name = (target_name or "").strip() or "未知页面"
+                    MB_ICONWARNING = 0x30
+                    MB_TOPMOST = 0x00040000
+                    MB_SETFOREGROUND = 0x00010000
+                    MB_SYSTEMMODAL = 0x00001000
+                    flags = (
+                        MB_ICONWARNING
+                        | MB_TOPMOST
+                        | MB_SETFOREGROUND
+                        | MB_SYSTEMMODAL
+                    )
+                    ctypes.windll.user32.MessageBoxW(
+                        None,
+                        f"[AI 护航拦截] 偏离目标：{name}",
+                        "FocusGuard 智能阻断",
+                        flags,
+                    )
+                except Exception:
+                    # 弹窗异常不影响主逻辑
+                    return
+
+            threading.Thread(
+                target=_ai_soft_block,
+                daemon=True,
+            ).start()
+            return
+
+        # LLM 明确放行：直接返回，浏览器不再进入静态标题规则
+        print(
+            f"[FocusGuard] LLM allow decision for browser, skip all static rules: "
+            f"target={focus_target!r}, browser_title={browser_title!r}, url={browser_url!r}"
+        )
+        return
+
+    # 第三关：静态规则兜底（仅非浏览器场景或无专注目标时生效）
+    if not matched_title:
+        return
+
+    print(
+        f"[FocusGuard] Static title rule matched: process={process_name}, pid={pid}, "
+        f"window_title={window_title!r}, browser_title={browser_title!r}, browser_url={browser_url!r}, "
+        f"by_title_window={matched_title_window}, by_title_browser={matched_title_browser}"
+    )
+
+    # 对于网页类拦截，更希望提示“哪个页面”而不是“哪个进程”
+    target_name = browser_title or window_title or (process_name or "受限内容")
+
+    def _soft_block() -> None:
+        _send_ctrl_w_to_foreground()
+        show_block_warning(target_name)
+
+    threading.Thread(
+        target=_soft_block,
+        daemon=True,
+    ).start()
 
 
 if __name__ == "__main__":

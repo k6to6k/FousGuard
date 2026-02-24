@@ -273,13 +273,13 @@ def _log_focus_session(target: str, minutes: int) -> None:
         print(f"[FocusGuard] Failed to write focus log: {e}")
 
 
-def _write_focus_command(minutes: int) -> None:
+def _write_focus_command(minutes: int, target: str) -> None:
     """
     将专注命令写入 focus_command.json，供主进程读取。
-    格式：{"minutes": X}
+    格式：{"minutes": X, "target": "专注目标文本"}
     """
     command_path = Path(__file__).with_name("focus_command.json")
-    command_data = {"minutes": minutes}
+    command_data = {"minutes": minutes, "target": target}
 
     try:
         with command_path.open("w", encoding="utf-8") as f:
@@ -339,8 +339,8 @@ def run_dashboard() -> None:
         # ① 将时间戳、目标、时长追加写入 focus_log.txt
         _log_focus_session(target_text, minutes)
         
-        # ② 将 {"minutes": X} 以 JSON 格式写入 focus_command.json
-        _write_focus_command(minutes)
+        # ② 将 {"minutes": X, "target": "..."} 以 JSON 格式写入 focus_command.json
+        _write_focus_command(minutes, target_text)
         
         # ③ 调用 sys.exit(0) 退出当前界面进程
         try:

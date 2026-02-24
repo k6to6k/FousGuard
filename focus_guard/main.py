@@ -43,6 +43,8 @@ class FocusState:
 
     def __init__(self) -> None:
         self._is_active: bool = False
+        # 当前专注目标（由 dashboard_ui 通过 focus_command.json 下发）
+        self.focus_target: str = ""
         self.end_time: float = 0.0
         self.timer_process: Optional[subprocess.Popen[bytes]] = None
         self.dashboard_process: Optional[subprocess.Popen[bytes]] = None
@@ -86,12 +88,13 @@ class FocusState:
             except Exception as e:
                 print(f"[FocusGuard] Icon update callback error: {e}")
 
-    def start_focus(self, minutes: int) -> None:
+    def start_focus(self, minutes: int, target: str = "") -> None:
         """
         开启专注模式，设置结束时间戳，并启动悬浮倒计时窗口。
         """
         with self._lock:
             self._is_active = True
+            self.focus_target = target or ""
             self.end_time = time.time() + minutes * 60
 
             # 启动悬浮倒计时子进程（非阻塞）
@@ -215,9 +218,14 @@ def monitor_loop(state: FocusState, config: Dict[str, Any]) -> None:
                     if minutes > 0:
                         # 读取成功后，立即删除文件
                         os.remove(command_file)
-                        # 调用 start_focus 开启专注
-                        state.start_focus(minutes)
-                        print(f"[FocusGuard] Focus command received: {minutes} minutes")
+                        # 读取专注目标（可选字段），并做安全 strip 处理
+                        raw_target = command_data.get("target", "")
+                        target = str(raw_target).strip() if raw_target is not None else ""
+                        # 调用 start_focus 开启专注，并记录本轮专注目标
+                        state.start_focus(minutes, target=target)
+                        print(
+                            f"[FocusGuard] Focus command received: {minutes} minutes, target={target!r}"
+                        )
                 except (json.JSONDecodeError, KeyError, OSError) as e:
                     # 文件格式错误或删除失败，记录日志但不影响主循环
                     print(f"[FocusGuard] Failed to process focus command: {e}")
@@ -279,6 +287,7 @@ def monitor_loop(state: FocusState, config: Dict[str, Any]) -> None:
                         config,
                         browser_url=browser_url,
                         browser_title=browser_title,
+                        focus_target=state.focus_target,
                     )
         except Exception as e:
             # 任何未预料异常都只记录，不让线程退出
