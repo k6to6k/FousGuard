@@ -13,6 +13,9 @@ from typing import Any
 
 import pystray
 from PIL import Image, ImageDraw
+import subprocess
+import sys
+from pathlib import Path
 
 
 def _create_icon(color: tuple[int, int, int]) -> Image.Image:
@@ -46,29 +49,83 @@ def run_tray_app(state_controller: Any) -> None:
     def get_current_icon():
         return active_icon if state_controller.is_active() else inactive_icon
 
-    def on_toggle_focus(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        state_controller.toggle()
-        # 根据当前状态更新托盘图标
+    def update_icon(icon: pystray.Icon) -> None:
         icon.icon = get_current_icon()
         icon.visible = True
 
+    def on_start_focus(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        # 通过子进程调用 setup_ui.py 设置专注时长
+        setup_path = Path(__file__).with_name("setup_ui.py")
+        try:
+            result = subprocess.run([sys.executable, str(setup_path)])
+        except Exception as e:
+            print(f"[FocusGuard] 启动专注时长设置界面失败：{e}")
+            return
+
+        # 安全校验：为了兼顾测试按钮，只要 returncode >= 1 就开启专注
+        if result.returncode >= 1:
+            state_controller.start_focus(result.returncode)
+            update_icon(icon)
+            print(f"[FocusGuard] 专注模式已启动：{result.returncode} 分钟")
+        else:
+            # 返回 0 表示用户取消，无事发生
+            print("[FocusGuard] 用户取消了专注时长设置")
+
+    def on_show_timer(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        # 重新显示悬浮倒计时窗口
+        state_controller.show_timer_widget()
+
     def on_emergency_exit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        # 占位实现：当前版本直接关闭专注模式，停止拦截
-        # 后续阶段再替换为 unlock_ui 子进程 + 高阻力解锁逻辑
-        state_controller.set_active(False)
-        icon.icon = get_current_icon()
-        icon.visible = True
-        print("[FocusGuard] 紧急退出：已关闭专注模式（占位实现，待接入 unlock_ui）")
+        # 通过子进程调用 emergency_ui.py 进行高阻力退出确认
+        emergency_path = Path(__file__).with_name("emergency_ui.py")
+        try:
+            result = subprocess.run([sys.executable, str(emergency_path)])
+        except Exception as e:
+            print(f"[FocusGuard] 启动紧急退出界面失败：{e}")
+            return
+
+        if result.returncode == 0:
+            # 用户完成冷静期并确认退出
+            state_controller.emergency_stop()
+            update_icon(icon)
+            print("[FocusGuard] 紧急退出成功：专注模式已解除")
+        else:
+            # 用户中途放弃或关闭窗口
+            print("[FocusGuard] 紧急退出已取消，保持专注模式")
 
     def on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
         # 请求停止后台线程，并退出托盘
         state_controller.request_stop()
         icon.stop()
 
+    # 动态菜单：根据专注状态显示不同项
     menu = pystray.Menu(
-        pystray.MenuItem("切换专注模式", on_toggle_focus),
-        pystray.MenuItem("紧急退出", on_emergency_exit),
-        pystray.MenuItem("彻底退出", on_quit),
+        pystray.MenuItem(
+            "开始专注",
+            on_start_focus,
+            visible=lambda item: not state_controller.is_active(),
+        ),
+        pystray.MenuItem(
+            "显示倒计时",
+            on_show_timer,
+            visible=lambda item: state_controller.is_active(),
+        ),
+        pystray.MenuItem(
+            "紧急退出 (需冷静)",
+            on_emergency_exit,
+            visible=lambda item: state_controller.is_active(),
+        ),
+        pystray.MenuItem(
+            "专注中 (不可退出)",
+            lambda icon, item: None,  # 空回调，不可点击
+            enabled=False,
+            visible=lambda item: state_controller.is_active(),
+        ),
+        pystray.MenuItem(
+            "彻底退出",
+            on_quit,
+            enabled=lambda item: not state_controller.is_active(),
+        ),
     )
 
     icon = pystray.Icon(
