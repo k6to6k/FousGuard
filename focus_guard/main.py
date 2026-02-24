@@ -261,6 +261,15 @@ def main() -> None:
     config = load_config()
     state = FocusState()
 
+    # 进入后台循环前清除遗留指令，防止开机或重启后误触发专注
+    command_file = Path(__file__).with_name("focus_command.json")
+    if command_file.exists():
+        try:
+            os.remove(command_file)
+            print("[FocusGuard] Removed stale focus_command.json")
+        except OSError as e:
+            print(f"[FocusGuard] Failed to remove focus_command.json: {e}")
+
     # 启动后台守护线程
     monitor_thread = threading.Thread(
         target=monitor_loop,
@@ -285,6 +294,15 @@ def main() -> None:
 
     # 在主线程启动托盘应用（阻塞式）
     tray_app.run_tray_app(state)
+
+    # 退出前强杀控制中心子进程，避免幽灵进程与残留指令
+    if state.dashboard_process is not None and state.dashboard_process.poll() is None:
+        try:
+            state.dashboard_process.terminate()
+            state.dashboard_process.wait(timeout=3.0)
+        except Exception as e:
+            print(f"[FocusGuard] Failed to terminate dashboard process: {e}")
+        state.dashboard_process = None
 
     # 托盘退出后，确保后台线程尽快结束
     state.request_stop()

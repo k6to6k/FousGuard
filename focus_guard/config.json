@@ -1,4 +1,10 @@
 {
-  "process_blacklist": ["notepad++.exe", "qq.exe"],
-  "title_blacklist": ["bilibili"]
+  "process_blacklist": [
+    "notepad++.exe",
+    "qq.exe",
+    "weixin.exe"
+  ],
+  "title_blacklist": [
+    "bilibili"
+  ]
 }
