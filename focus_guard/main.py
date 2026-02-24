@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import blocker
 import monitor
@@ -34,8 +35,11 @@ class FocusState:
         self._is_active: bool = False
         self.end_time: float = 0.0
         self.timer_process: Optional[subprocess.Popen[bytes]] = None
+        self.dashboard_process: Optional[subprocess.Popen[bytes]] = None
         self._stop_flag: bool = False
         self._lock = threading.Lock()
+        # 由 tray_app 注册，用于在专注状态变化时同步更新托盘图标（避免 monitor_loop 异步触发时图标不变色）
+        self._on_icon_update: Optional[Callable[[], None]] = None
 
     def is_active(self) -> bool:
         with self._lock:
@@ -57,6 +61,20 @@ class FocusState:
                     finally:
                         self.timer_process = None
         print(f"[FocusGuard] Focus mode set to: {self._is_active}")
+        self._notify_icon_update()
+
+    def set_icon_update_callback(self, callback: Callable[[], None]) -> None:
+        """由 tray_app 调用，注册托盘图标更新回调；专注状态变化时会在无锁情况下调用，避免死锁。"""
+        self._on_icon_update = callback
+
+    def _notify_icon_update(self) -> None:
+        """在未持锁状态下调用注册的图标更新回调，供 set_active/start_focus 使用。"""
+        cb = self._on_icon_update
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                print(f"[FocusGuard] Icon update callback error: {e}")
 
     def start_focus(self, minutes: int) -> None:
         """
@@ -80,6 +98,7 @@ class FocusState:
                 self.timer_process = None
 
         print(f"[FocusGuard] Focus mode started: {minutes} minutes, ends at {self.end_time:.1f}")
+        self._notify_icon_update()
 
     def get_end_time(self) -> float:
         with self._lock:
@@ -137,6 +156,7 @@ class FocusState:
                     self.timer_process = None
 
         print("[FocusGuard] Emergency stop: focus mode disabled")
+        self._notify_icon_update()
 
     def request_stop(self) -> None:
         with self._lock:
@@ -166,12 +186,38 @@ def monitor_loop(state: FocusState, config: Dict[str, Any]) -> None:
     """
     后台守护线程：每隔 1.5 秒轮询当前前台窗口，并在专注模式开启时调用阻断模块。
     同时检查专注是否到期，到期时自动结束并弹出提示。
+    每次循环检查 focus_command.json，如果存在则读取并启动专注。
 
     所有异常必须被捕获，绝不能导致线程崩溃退出。
     """
     print("[FocusGuard] Background monitor loop started.")
+    command_file = Path(__file__).with_name("focus_command.json")
+    
     while not state.should_stop():
         try:
+            # 检查是否存在 focus_command.json（专注启动命令）
+            if command_file.exists():
+                try:
+                    with command_file.open("r", encoding="utf-8") as f:
+                        command_data: Dict[str, Any] = json.load(f)
+                    
+                    minutes = command_data.get("minutes", 0)
+                    if minutes > 0:
+                        # 读取成功后，立即删除文件
+                        os.remove(command_file)
+                        # 调用 start_focus 开启专注
+                        state.start_focus(minutes)
+                        print(f"[FocusGuard] Focus command received: {minutes} minutes")
+                except (json.JSONDecodeError, KeyError, OSError) as e:
+                    # 文件格式错误或删除失败，记录日志但不影响主循环
+                    print(f"[FocusGuard] Failed to process focus command: {e}")
+                    # 尝试删除损坏的命令文件
+                    try:
+                        if command_file.exists():
+                            os.remove(command_file)
+                    except Exception:
+                        pass
+
             current_time = time.time()
 
             if state.is_active():
@@ -223,6 +269,19 @@ def main() -> None:
         name="FocusGuardMonitor",
     )
     monitor_thread.start()
+
+    # 非阻塞拉起 dashboard_ui.py（控制中心主窗口）
+    try:
+        dashboard_script = Path(__file__).with_name("dashboard_ui.py")
+        state.dashboard_process = subprocess.Popen(
+            [sys.executable, str(dashboard_script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"[FocusGuard] Dashboard UI started (pid={state.dashboard_process.pid})")
+    except Exception as e:
+        print(f"[FocusGuard] Failed to start dashboard UI: {e}")
+        state.dashboard_process = None
 
     # 在主线程启动托盘应用（阻塞式）
     tray_app.run_tray_app(state)

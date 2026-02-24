@@ -53,23 +53,34 @@ def run_tray_app(state_controller: Any) -> None:
         icon.icon = get_current_icon()
         icon.visible = True
 
-    def on_start_focus(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        # 通过子进程调用 setup_ui.py 设置专注时长
-        setup_path = Path(__file__).with_name("setup_ui.py")
-        try:
-            result = subprocess.run([sys.executable, str(setup_path)])
-        except Exception as e:
-            print(f"[FocusGuard] 启动专注时长设置界面失败：{e}")
+    def on_show_dashboard(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        # 防作弊：专注期间禁止呼出控制中心（左键/双击触发时也在此拦截）
+        if state_controller.is_active():
             return
-
-        # 安全校验：为了兼顾测试按钮，只要 returncode >= 1 就开启专注
-        if result.returncode >= 1:
-            state_controller.start_focus(result.returncode)
-            update_icon(icon)
-            print(f"[FocusGuard] 专注模式已启动：{result.returncode} 分钟")
-        else:
-            # 返回 0 表示用户取消，无事发生
-            print("[FocusGuard] 用户取消了专注时长设置")
+        # 显示控制中心：检查 dashboard_process 是否还在运行，如果已退出则重新拉起
+        dashboard_process = getattr(state_controller, "dashboard_process", None)
+        
+        if dashboard_process is not None:
+            # 检查进程是否仍在运行
+            if dashboard_process.poll() is None:
+                # 进程仍在运行，无需重新启动
+                print("[FocusGuard] Dashboard UI is already running")
+                return
+            # 进程已退出，清理引用
+            state_controller.dashboard_process = None
+        
+        # 重新启动控制中心
+        try:
+            dashboard_script = Path(__file__).with_name("dashboard_ui.py")
+            state_controller.dashboard_process = subprocess.Popen(
+                [sys.executable, str(dashboard_script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[FocusGuard] Dashboard UI restarted (pid={state_controller.dashboard_process.pid})")
+        except Exception as e:
+            print(f"[FocusGuard] Failed to restart dashboard UI: {e}")
+            state_controller.dashboard_process = None
 
     def on_show_timer(icon: pystray.Icon, item: pystray.MenuItem) -> None:
         # 重新显示悬浮倒计时窗口
@@ -101,9 +112,10 @@ def run_tray_app(state_controller: Any) -> None:
     # 动态菜单：根据专注状态显示不同项
     menu = pystray.Menu(
         pystray.MenuItem(
-            "开始专注",
-            on_start_focus,
-            visible=lambda item: not state_controller.is_active(),
+            "显示控制中心",
+            on_show_dashboard,
+            enabled=lambda item: not state_controller.is_active(),
+            default=True,  # 左键单击托盘图标时触发此项；专注时 enabled=False，回调内也有 guard
         ),
         pystray.MenuItem(
             "显示倒计时",
@@ -134,6 +146,9 @@ def run_tray_app(state_controller: Any) -> None:
         title="FocusGuard",
         menu=menu,
     )
+
+    # 注册图标更新回调，使 monitor_loop 在异步触发 start_focus/set_active 后能同步更新托盘图标
+    state_controller.set_icon_update_callback(lambda: update_icon(icon))
 
     # 重要：icon.run() 是阻塞的，必须在主线程中调用
     icon.run()
