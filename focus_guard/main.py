@@ -22,6 +22,16 @@ from typing import Any, Callable, Dict, Optional
 import blocker
 import monitor
 import tray_app
+import server
+
+# 被视为“浏览器进程”的可执行文件名（小写）
+BROWSER_PROCESSES = {
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+}
 
 
 class FocusState:
@@ -246,7 +256,30 @@ def monitor_loop(state: FocusState, config: Dict[str, Any]) -> None:
                 else:
                     # 专注进行中：执行阻断逻辑
                     process_name, window_title, pid = monitor.get_active_window_info()
-                    blocker.enforce_rules(process_name, window_title, pid, config)
+
+                    browser_url = ""
+                    browser_title = ""
+                    # 若当前前台为浏览器进程，则尝试从 server.CURRENT_BROWSER_TAB 中补齐标签页特征
+                    if process_name and process_name.lower() in BROWSER_PROCESSES:
+                        try:
+                            with server.tab_lock:
+                                browser_url = str(
+                                    server.CURRENT_BROWSER_TAB.get("url", "") or ""
+                                )
+                                browser_title = str(
+                                    server.CURRENT_BROWSER_TAB.get("title", "") or ""
+                                )
+                        except Exception as e:
+                            print(f"[FocusGuard] Failed to bridge browser tab data: {e}")
+
+                    blocker.enforce_rules(
+                        process_name,
+                        window_title,
+                        pid,
+                        config,
+                        browser_url=browser_url,
+                        browser_title=browser_title,
+                    )
         except Exception as e:
             # 任何未预料异常都只记录，不让线程退出
             print(f"[FocusGuard] Unexpected error in monitor loop: {e}")
@@ -260,6 +293,14 @@ def monitor_loop(state: FocusState, config: Dict[str, Any]) -> None:
 def main() -> None:
     config = load_config()
     state = FocusState()
+
+    # 启动本地 HTTP 微服务，用于接收浏览器扩展上报的标签页特征
+    http_thread = threading.Thread(
+        target=server.start_server,
+        daemon=True,
+        name="FocusGuardHttpServer",
+    )
+    http_thread.start()
 
     # 进入后台循环前清除遗留指令，防止开机或重启后误触发专注
     command_file = Path(__file__).with_name("focus_command.json")

@@ -5,6 +5,7 @@
     "weixin.exe"
   ],
   "title_blacklist": [
-    "bilibili"
+    "bilibili",
+    "漫威"
   ]
 }

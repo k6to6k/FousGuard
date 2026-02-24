@@ -7,7 +7,7 @@ FocusGuard 控制中心 (dashboard_ui.py)
 - 提供三大核心功能区：专注台、规则库、统计局
 - 专注台：接管原 setup_ui.py 的功能，作为专注启动的图形化入口
 - 规则库：可视化黑名单管理与 Smart Picker（进程/标题黑名单、一键嗅探活跃进程）
-- 统计局：读取并解析 focus_log.txt（建设中）
+- 统计局：读取并解析 focus_log.txt，展示今日/累计专注与历史记录
 """
 
 from __future__ import annotations
@@ -18,6 +18,13 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import urllib.request
+import urllib.error
+
+# 统计局：单条记录 (时间戳字符串, 目标文本, 分钟数)
+StatsRecord = Tuple[str, str, int]
+# 统计局：_load_statistics 返回结构
+StatsData = Dict[str, Any]
 
 import customtkinter as ctk
 import psutil
@@ -65,6 +72,76 @@ def save_config(config_data: Dict[str, Any]) -> None:
             json.dump(config_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[FocusGuard] save_config error: {e}")
+
+
+def _format_duration(minutes: int) -> str:
+    """将分钟数转为「X 小时 Y 分钟」展示。"""
+    if minutes <= 0:
+        return "0 分钟"
+    h, m = divmod(minutes, 60)
+    if h == 0:
+        return f"{m} 分钟"
+    if m == 0:
+        return f"{h} 小时"
+    return f"{h} 小时 {m} 分钟"
+
+
+def _load_statistics() -> StatsData:
+    """
+    读取同目录 focus_log.txt，解析为统计局所需数据。
+    格式约定：时间戳 | 目标文本 | 分钟数（如 2026-02-24 10:30:00 | 算法复习 | 25）。
+    若文件不存在或解析失败，返回空结构。
+    返回字段：today_minutes, total_minutes, today_str, total_str, records。
+    """
+    log_path = Path(__file__).resolve().with_name("focus_log.txt")
+    empty: StatsData = {
+        "today_minutes": 0,
+        "total_minutes": 0,
+        "today_str": "0 分钟",
+        "total_str": "0 分钟",
+        "records": [],
+    }
+    if not log_path.exists():
+        return empty
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[FocusGuard] _load_statistics read error: {e}")
+        return empty
+
+    today_date = datetime.date.today()
+    total_minutes = 0
+    today_minutes = 0
+    records: List[StatsRecord] = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(" | ", 2)
+        if len(parts) != 3:
+            continue
+        ts_str, target, min_str = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        try:
+            minutes = int(min_str)
+        except ValueError:
+            continue
+        try:
+            dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        total_minutes += minutes
+        if dt.date() == today_date:
+            today_minutes += minutes
+        records.append((ts_str, target, minutes))
+
+    return {
+        "today_minutes": today_minutes,
+        "total_minutes": total_minutes,
+        "today_str": _format_duration(today_minutes),
+        "total_str": _format_duration(total_minutes),
+        "records": records,
+    }
 
 
 def _sniff_active_process_names() -> List[str]:
@@ -578,53 +655,109 @@ def run_dashboard() -> None:
     refresh_title_list()
 
     def open_title_picker() -> None:
-        titles = _sniff_active_window_titles()
-        if not titles:
+        # 从本地 FocusGuard HTTP 服务获取最近浏览器标签页特征
+        api_url = "http://127.0.0.1:11235/api/recent_tabs"
+        try:
+            with urllib.request.urlopen(api_url, timeout=2) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, list) or not data:
+                info = ctk.CTkToplevel(root)
+                info.title("暂无标签页数据")
+                info.attributes("-topmost", True)
+                info.geometry("360x120")
+                info.transient(root)
+                ctk.CTkLabel(
+                    info,
+                    text="当前没有可用的浏览器标签页数据。\n请在浏览器中切换或打开几个标签页后重试。",
+                    font=ctk.CTkFont(size=12),
+                    anchor="center",
+                    justify="center",
+                    wraplength=320,
+                ).pack(fill="both", expand=True, padx=16, pady=16)
+                return
+        except (urllib.error.URLError, TimeoutError, OSError):
+            warn = ctk.CTkToplevel(root)
+            warn.title("无法连接 FocusGuard 本地服务")
+            warn.attributes("-topmost", True)
+            warn.geometry("360x120")
+            warn.transient(root)
+            ctk.CTkLabel(
+                warn,
+                text="请先开启 FocusGuard 主程序以接收浏览器数据。",
+                font=ctk.CTkFont(size=12),
+                anchor="center",
+                justify="center",
+                wraplength=320,
+            ).pack(fill="both", expand=True, padx=16, pady=16)
             return
+        except Exception as e:
+            print(f"[FocusGuard] 获取 recent_tabs 失败: {e}")
+            return
+
+        # 构建标签页选择窗口
         toplevel = ctk.CTkToplevel(root)
-        toplevel.title("选择窗口标题（提取至输入框）")
+        toplevel.title("嗅探近期浏览器标签页")
         toplevel.attributes("-topmost", True)
-        toplevel.geometry("500x400")
+        toplevel.geometry("600x420")
         toplevel.transient(root)
 
         ctk.CTkLabel(
             toplevel,
-            text="以下为当前可见窗口的标题。点击「提取至输入框」可将标题填入右侧输入框，便于您删减为关键字后再点击【添加】。",
+            text="以下为近期浏览器标签页。点击「提取标题」或「提取 URL」可将文本填入右侧输入框，便于精修为关键字后再点击【添加】。",
             font=ctk.CTkFont(size=12),
             anchor="w",
-            wraplength=460,
+            wraplength=560,
         ).pack(fill="x", padx=16, pady=(16, 8))
 
         scroll = ctk.CTkScrollableFrame(toplevel)
         scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
-        for title in sorted(titles, key=lambda t: t.lower()):
+        # data 形如 [{"title": ..., "url": ..., "timestamp": ...}, ...]，server 已按时间倒序
+        for item in data:
+            title_val = str(item.get("title", "") or "")
+            url_val = str(item.get("url", "") or "")
+            display = title_val or url_val or "(空标题)"
+
             row = ctk.CTkFrame(scroll)
-            row.pack(fill="x", pady=2)
-            # 标题可能很长，用 wraplength 或 truncate 显示
-            display = title if len(title) <= 50 else title[:47] + "..."
+            row.pack(fill="x", pady=3)
+
             ctk.CTkLabel(
-                row, text=display, font=ctk.CTkFont(size=11), anchor="w"
+                row,
+                text=f"{display} ({url_val})",
+                font=ctk.CTkFont(size=11),
+                anchor="w",
+                wraplength=360,
             ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
 
-            def _fill_entry(t: str) -> None:
+            def _fill_with(text: str) -> None:
                 entry_title.delete(0, "end")
-                entry_title.insert(0, t)
+                entry_title.insert(0, text)
                 toplevel.destroy()
 
             ctk.CTkButton(
                 row,
-                text="提取至输入框",
-                width=100,
-                height=28,
+                text="提取标题",
+                width=80,
+                height=26,
                 fg_color=("#16a085", "#1e8449"),
                 hover_color=("#1abc9c", "#27ae60"),
-                command=lambda t=title: _fill_entry(t),
-            ).pack(side="right", padx=8, pady=4)
+                command=lambda t=title_val: _fill_with(t),
+            ).pack(side="right", padx=(4, 4), pady=4)
+
+            ctk.CTkButton(
+                row,
+                text="提取 URL",
+                width=80,
+                height=26,
+                fg_color=("#566573", "#2c3e50"),
+                hover_color=("#808b96", "#34495e"),
+                command=lambda u=url_val: _fill_with(u),
+            ).pack(side="right", padx=(4, 4), pady=4)
 
     ctk.CTkButton(
         right_frame,
-        text="一键嗅探活跃窗口",
+        text="嗅探近期浏览器标签页",
         font=ctk.CTkFont(size=12, weight="bold"),
         height=36,
         fg_color=("#16a085", "#1e8449"),
@@ -634,13 +767,75 @@ def run_dashboard() -> None:
 
     # Tab 3: 统计局 (Statistics)
     stats_tab = tabview.add("统计局")
-    
-    building_label2 = ctk.CTkLabel(
-        stats_tab,
-        text="建设中...",
-        font=ctk.CTkFont(size=16),
+
+    # 顶部数据看板容器
+    stats_top_frame = ctk.CTkFrame(stats_tab)
+    stats_top_frame.pack(fill="x", padx=16, pady=(16, 12))
+
+    today_label = ctk.CTkLabel(
+        stats_top_frame,
+        text="今日专注：0 分钟",
+        font=ctk.CTkFont(size=24, weight="bold"),
+        anchor="center",
     )
-    building_label2.pack(expand=True)
+    today_label.pack(pady=(12, 4))
+
+    total_label = ctk.CTkLabel(
+        stats_top_frame,
+        text="累计总专注：0 分钟",
+        font=ctk.CTkFont(size=24, weight="bold"),
+        anchor="center",
+    )
+    total_label.pack(pady=(0, 8))
+
+    stats_scroll = ctk.CTkScrollableFrame(stats_tab)
+    stats_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+    def refresh_stats_panel() -> None:
+        data = _load_statistics()
+        today_label.configure(text=f"今日专注：{data['today_str']}")
+        total_label.configure(text=f"累计总专注：{data['total_str']}")
+        for w in stats_scroll.winfo_children():
+            w.destroy()
+        records = data["records"]
+        if not records:
+            ctk.CTkLabel(
+                stats_scroll,
+                text="暂无专注数据，快去开启你的第一个番茄钟吧！",
+                font=ctk.CTkFont(size=14),
+                text_color=("gray50", "gray45"),
+            ).pack(expand=True, pady=40)
+            return
+        for ts_str, target, minutes in reversed(records):
+            row = ctk.CTkFrame(stats_scroll)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row, text=ts_str, font=ctk.CTkFont(size=11), anchor="w", width=180
+            ).pack(side="left", padx=8, pady=6)
+            ctk.CTkLabel(
+                row, text=target or "—", font=ctk.CTkFont(size=11), anchor="w"
+            ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
+            ctk.CTkLabel(
+                row,
+                text=_format_duration(minutes),
+                font=ctk.CTkFont(size=11),
+                anchor="e",
+                width=80,
+            ).pack(side="right", padx=8, pady=6)
+
+    refresh_stats_panel()
+
+    btn_refresh_stats = ctk.CTkButton(
+        stats_top_frame,
+        text="刷新数据",
+        width=70,
+        height=24,
+        font=ctk.CTkFont(size=11),
+        fg_color=("gray65", "gray35"),
+        hover_color=("gray55", "gray45"),
+        command=refresh_stats_panel,
+    )
+    btn_refresh_stats.place(relx=1.0, rely=0.0, x=-12, y=8, anchor="ne")
 
     root.mainloop()
 

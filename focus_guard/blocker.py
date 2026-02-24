@@ -230,6 +230,8 @@ def enforce_rules(
     window_title: Optional[str],
     pid: Optional[int],
     config: Dict[str, Any],
+    browser_url: str = "",
+    browser_title: str = "",
 ) -> None:
     """
     核心方法：根据配置判断当前前台窗口是否违规，并按命中类型执行不同策略。
@@ -239,6 +241,8 @@ def enforce_rules(
     - window_title: 当前前台窗口标题（小写，可能为 None）
     - pid: 当前前台窗口所属进程的 PID（可能为 None）
     - config: 从 config.json 读取的配置字典
+    - browser_url: 来自浏览器扩展的当前标签页 URL（可能为空）
+    - browser_title: 来自浏览器扩展的当前标签页标题（可能为空）
     """
     if not process_name and not window_title:
         return
@@ -246,13 +250,27 @@ def enforce_rules(
     # 确保全局匹配索引已根据最新配置构建
     _ensure_rule_index(config)
 
-    matched_process, matched_title = _match_rules(process_name, window_title)
+    matched_process, matched_title_window = _match_rules(process_name, window_title)
+
+    # 使用浏览器扩展提供的 title/url 进行补充匹配
+    matched_title_browser = False
+    if _TITLE_PATTERNS is not None:
+        bt = (browser_title or "").lower()
+        bu = (browser_url or "").lower()
+        for pattern in _TITLE_PATTERNS:
+            if (bt and pattern.search(bt)) or (bu and pattern.search(bu)):
+                matched_title_browser = True
+                break
+
+    matched_title = matched_title_window or matched_title_browser
+
     if not matched_process and not matched_title:
         return
 
     print(
-        f"[FocusGuard] Block rule matched: process={process_name}, pid={pid}, title={window_title!r}, "
-        f"by_process={matched_process}, by_title={matched_title}"
+        f"[FocusGuard] Block rule matched: process={process_name}, pid={pid}, "
+        f"window_title={window_title!r}, browser_title={browser_title!r}, browser_url={browser_url!r}, "
+        f"by_process={matched_process}, by_title_window={matched_title_window}, by_title_browser={matched_title_browser}"
     )
 
     # 1. 若命中进程黑名单：强力阻断（kill 进程）
@@ -267,7 +285,7 @@ def enforce_rules(
     #    - 同时弹出系统模态警告，文案优先展示网页标题信息而不是浏览器进程名。
     if matched_title and not matched_process:
         # 对于网页类拦截，更希望提示“哪个页面”而不是“哪个进程”
-        target_name = window_title or (process_name or "受限内容")
+        target_name = browser_title or window_title or (process_name or "受限内容")
         def _soft_block():
             _send_ctrl_w_to_foreground()
             show_block_warning(target_name)

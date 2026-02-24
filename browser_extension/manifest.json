@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "FocusGuard 智能护航",
+  "version": "1.0",
+  "description": "FocusGuard 专属 Chromium 浏览器扩展 (兼容 Chrome/Edge)，用于采集当前标签页的 URL 与标题，为智能网页拦截与大模型意图分类提供数据基础。",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
+
