@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import urllib.request
 import urllib.error
+import ctypes
 
 # 统计局：单条记录 (时间戳字符串, 目标文本, 分钟数)
 StatsRecord = Tuple[str, str, int]
@@ -30,6 +31,13 @@ import customtkinter as ctk
 import psutil
 import win32gui
 import win32process
+import matplotlib
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+# 全局配置 Matplotlib 的中文字体与负号显示，避免图表中文字变成方块或负号丢失
+matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei"]
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 try:
     import win32com.client
@@ -327,11 +335,11 @@ def run_dashboard() -> None:
     )
     target_entry.pack(fill="x", pady=(0, 20), padx=20)
 
-    # 时长选择按钮容器
+    # 时长选择按钮容器（快捷时长）
     btn_frame = ctk.CTkFrame(focus_tab)
-    btn_frame.pack(fill="x", pady=(0, 20), padx=20)
+    btn_frame.pack(fill="x", pady=(0, 12), padx=20)
 
-    def start_focus(minutes: int) -> None:
+    def _start_focus_with_minutes(minutes: int) -> None:
         """开始专注：写入日志、写入命令文件、退出界面进程"""
         # 获取专注目标文本
         target_text = target_entry.get().strip() or "未设置目标"
@@ -349,12 +357,12 @@ def run_dashboard() -> None:
             pass
         sys.exit(0)
 
-    # 四个时长按钮
+    # 四个快捷时长按钮
     btn_25 = ctk.CTkButton(
         btn_frame,
         text="25 分钟",
         font=ctk.CTkFont(size=12, weight="bold"),
-        command=lambda: start_focus(25),
+        command=lambda: _start_focus_with_minutes(25),
         height=40,
         corner_radius=8,
     )
@@ -364,7 +372,7 @@ def run_dashboard() -> None:
         btn_frame,
         text="45 分钟",
         font=ctk.CTkFont(size=12, weight="bold"),
-        command=lambda: start_focus(45),
+        command=lambda: _start_focus_with_minutes(45),
         height=40,
         corner_radius=8,
     )
@@ -374,7 +382,7 @@ def run_dashboard() -> None:
         btn_frame,
         text="60 分钟",
         font=ctk.CTkFont(size=12, weight="bold"),
-        command=lambda: start_focus(60),
+        command=lambda: _start_focus_with_minutes(60),
         height=40,
         corner_radius=8,
     )
@@ -384,12 +392,67 @@ def run_dashboard() -> None:
         btn_frame,
         text="1 分钟 (测试)",
         font=ctk.CTkFont(size=11),
-        command=lambda: start_focus(1),
+        command=lambda: _start_focus_with_minutes(1),
         height=32,
         corner_radius=6,
         fg_color=("gray70", "gray30"),
     )
     btn_test.pack(fill="x")
+
+    # 自定义时长区域（水平排列）
+    custom_frame = ctk.CTkFrame(focus_tab)
+    custom_frame.pack(fill="x", pady=(8, 20), padx=20)
+
+    custom_label = ctk.CTkLabel(
+        custom_frame,
+        text="自定义时长(分钟)：",
+        font=ctk.CTkFont(size=11),
+        anchor="w",
+    )
+    custom_label.pack(side="left", padx=(4, 8), pady=8)
+
+    custom_time_entry = ctk.CTkEntry(
+        custom_frame,
+        width=70,
+        font=ctk.CTkFont(size=11),
+    )
+    custom_time_entry.pack(side="left", padx=(0, 8), pady=8)
+
+    def _start_custom_focus() -> None:
+        """从输入框读取自定义分钟数并启动专注（含防御性校验）。"""
+        raw_value = custom_time_entry.get().strip()
+        try:
+            minutes = int(raw_value)
+        except Exception:
+            minutes = -1
+
+        if not raw_value or minutes <= 0 or minutes > 360:
+            try:
+                MB_ICONERROR = 0x10
+                MB_TOPMOST = 0x00040000
+                flags = MB_ICONERROR | MB_TOPMOST
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "请输入 1 到 360 之间的有效整数！",
+                    "FocusGuard 输入错误",
+                    flags,
+                )
+            except Exception:
+                print("[FocusGuard] 无效的自定义时长输入")
+            return
+
+        # 校验通过，复用统一的启动逻辑
+        _start_focus_with_minutes(minutes)
+
+    custom_start_btn = ctk.CTkButton(
+        custom_frame,
+        text="开始",
+        font=ctk.CTkFont(size=11, weight="bold"),
+        command=_start_custom_focus,
+        height=32,
+        corner_radius=8,
+    )
+    custom_start_btn.pack(side="left", padx=(0, 4), pady=8, fill="x", expand=True)
 
     # Tab 2: 规则库 (Blacklist)
     blacklist_tab = tabview.add("规则库")
@@ -768,74 +831,182 @@ def run_dashboard() -> None:
     # Tab 3: 统计局 (Statistics)
     stats_tab = tabview.add("统计局")
 
-    # 顶部数据看板容器
-    stats_top_frame = ctk.CTkFrame(stats_tab)
-    stats_top_frame.pack(fill="x", padx=16, pady=(16, 12))
+    # 顶层：使用可滚动容器承载整个统计局内容
+    stats_scroll = ctk.CTkScrollableFrame(stats_tab)
+    stats_scroll.pack(fill="both", expand=True, padx=16, pady=16)
+
+    # Top Layer: KPI 数据卡片区域
+    kpi_frame = ctk.CTkFrame(stats_scroll)
+    kpi_frame.pack(fill="x", pady=(0, 16))
 
     today_label = ctk.CTkLabel(
-        stats_top_frame,
+        kpi_frame,
         text="今日专注：0 分钟",
-        font=ctk.CTkFont(size=24, weight="bold"),
+        font=ctk.CTkFont(size=18, weight="bold"),
         anchor="center",
     )
-    today_label.pack(pady=(12, 4))
+    today_label.pack(side="left", expand=True, padx=8, pady=8)
 
     total_label = ctk.CTkLabel(
-        stats_top_frame,
+        kpi_frame,
         text="累计总专注：0 分钟",
-        font=ctk.CTkFont(size=24, weight="bold"),
+        font=ctk.CTkFont(size=18, weight="bold"),
         anchor="center",
     )
-    total_label.pack(pady=(0, 8))
+    total_label.pack(side="left", expand=True, padx=8, pady=8)
 
-    stats_scroll = ctk.CTkScrollableFrame(stats_tab)
-    stats_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+    top_target_label = ctk.CTkLabel(
+        kpi_frame,
+        text="最常目标：—",
+        font=ctk.CTkFont(size=18, weight="bold"),
+        anchor="center",
+    )
+    top_target_label.pack(side="left", expand=True, padx=8, pady=8)
 
-    def refresh_stats_panel() -> None:
+    # Middle Layer: 近 7 日趋势图容器
+    trend_frame = ctk.CTkFrame(stats_scroll)
+    trend_frame.pack(fill="both", expand=True, pady=(0, 16))
+
+    # Bottom Layer: 环形图 + 历史记录
+    bottom_frame = ctk.CTkFrame(stats_scroll)
+    bottom_frame.pack(fill="both", expand=True)
+
+    pie_frame = ctk.CTkFrame(bottom_frame)
+    pie_frame.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+
+    history_frame = ctk.CTkFrame(bottom_frame)
+    history_frame.pack(side="right", fill="both", expand=True, padx=(8, 0), pady=8)
+
+    history_box = ctk.CTkTextbox(
+        history_frame,
+        wrap="none",
+        font=ctk.CTkFont(size=11),
+    )
+    history_box.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _refresh_statistics() -> None:
+        """刷新统计局数据与图表（暗黑主题 Dashboard）。"""
+        # 全局暗黑样式（每次刷新确保样式一致）
+        BG_COLOR = "#2B2B2B"
+        matplotlib.rcParams["axes.facecolor"] = BG_COLOR
+        matplotlib.rcParams["figure.facecolor"] = BG_COLOR
+
         data = _load_statistics()
+        records = data["records"]
+
+        # 计算 KPI：今日总时长、累计总时长、最常目标
         today_label.configure(text=f"今日专注：{data['today_str']}")
         total_label.configure(text=f"累计总专注：{data['total_str']}")
-        for w in stats_scroll.winfo_children():
-            w.destroy()
-        records = data["records"]
+
+        target_to_minutes: Dict[str, int] = {}
+        for ts_str, target, minutes in records:
+            key = (target or "").strip() or "未设置目标"
+            target_to_minutes[key] = target_to_minutes.get(key, 0) + minutes
+
+        if target_to_minutes:
+            top_target, _ = max(target_to_minutes.items(), key=lambda x: x[1])
+            top_target_label.configure(text=f"最常目标：{top_target}")
+        else:
+            top_target_label.configure(text="最常目标：—")
+
+        # 清空旧图表 Canvas，防止刷新叠加与内存泄漏
+        for frame in (trend_frame, pie_frame):
+            for w in frame.winfo_children():
+                w.destroy()
+
+        # 清理历史记录
+        history_box.configure(state="normal")
+        history_box.delete("1.0", "end")
+
         if not records:
-            ctk.CTkLabel(
-                stats_scroll,
-                text="暂无专注数据，快去开启你的第一个番茄钟吧！",
-                font=ctk.CTkFont(size=14),
-                text_color=("gray50", "gray45"),
-            ).pack(expand=True, pady=40)
+            history_box.insert("end", "暂无专注数据，快去开启你的第一个番茄钟吧！\n")
+            history_box.configure(state="disabled")
             return
-        for ts_str, target, minutes in reversed(records):
-            row = ctk.CTkFrame(stats_scroll)
-            row.pack(fill="x", pady=2)
-            ctk.CTkLabel(
-                row, text=ts_str, font=ctk.CTkFont(size=11), anchor="w", width=180
-            ).pack(side="left", padx=8, pady=6)
-            ctk.CTkLabel(
-                row, text=target or "—", font=ctk.CTkFont(size=11), anchor="w"
-            ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
-            ctk.CTkLabel(
-                row,
-                text=_format_duration(minutes),
-                font=ctk.CTkFont(size=11),
-                anchor="e",
-                width=80,
-            ).pack(side="right", padx=8, pady=6)
 
-    refresh_stats_panel()
+        # 统计近 7 日每天专注总分钟数
+        today_date = datetime.date.today()
+        days = [today_date - datetime.timedelta(days=i) for i in range(6, -1, -1)]
+        day_labels = [d.strftime("%Y-%m-%d") for d in days]
+        day_set = {d for d in days}
+        date_to_minutes: Dict[str, int] = {label: 0 for label in day_labels}
 
-    btn_refresh_stats = ctk.CTkButton(
-        stats_top_frame,
-        text="刷新数据",
-        width=70,
-        height=24,
-        font=ctk.CTkFont(size=11),
-        fg_color=("gray65", "gray35"),
-        hover_color=("gray55", "gray45"),
-        command=refresh_stats_panel,
-    )
-    btn_refresh_stats.place(relx=1.0, rely=0.0, x=-12, y=8, anchor="ne")
+        for ts_str, target, minutes in records:
+            try:
+                dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            d = dt.date()
+            if d in day_set:
+                key = d.strftime("%Y-%m-%d")
+                date_to_minutes[key] = date_to_minutes.get(key, 0) + minutes
+
+        # Middle：近 7 日专注趋势柱状图（暗黑主题）
+        fig_trend = Figure(figsize=(8, 3), dpi=100, facecolor=BG_COLOR)
+        ax1 = fig_trend.add_subplot(111, facecolor=BG_COLOR)
+        y_values = [date_to_minutes[label] for label in day_labels]
+        bars = ax1.bar(range(len(day_labels)), y_values, color="#4AA3DF")
+        ax1.set_title("近 7 日专注时长（分钟）", color="white")
+        ax1.set_xlabel("日期", color="white")
+        ax1.set_ylabel("专注分钟数", color="white")
+        ax1.set_xticks(range(len(day_labels)))
+        ax1.set_xticklabels(day_labels, rotation=45, ha="right", color="white")
+
+        # 隐藏多余边框，仅保留底边框
+        for spine in ("top", "left", "right"):
+            ax1.spines[spine].set_visible(False)
+        ax1.spines["bottom"].set_color("white")
+
+        # 横向虚线网格
+        ax1.yaxis.grid(True, linestyle="--", alpha=0.3, color="white")
+        ax1.tick_params(axis="y", colors="white")
+
+        canvas_trend = FigureCanvasTkAgg(fig_trend, master=trend_frame)
+        widget_trend = canvas_trend.get_tk_widget()
+        widget_trend.pack(fill="both", expand=True, padx=8, pady=8)
+        canvas_trend.draw()
+
+        # Bottom Left：按目标累计时长环形图（Donut Chart）
+        if target_to_minutes:
+            sorted_items = sorted(
+                target_to_minutes.items(), key=lambda x: x[1], reverse=True
+            )
+            top_items = sorted_items[:5]
+            if len(sorted_items) > 5:
+                other_sum = sum(v for _, v in sorted_items[5:])
+                top_items.append(("其他", other_sum))
+
+            labels2 = [k for k, _ in top_items]
+            sizes2 = [v for _, v in top_items]
+
+            fig_pie = Figure(figsize=(4, 4), dpi=100, facecolor=BG_COLOR)
+            ax2 = fig_pie.add_subplot(111, facecolor=BG_COLOR)
+            wedges, texts = ax2.pie(
+                sizes2,
+                labels=labels2,
+                startangle=140,
+                textprops={"color": "white", "fontsize": 9},
+            )
+            # 环形图中间挖空
+            centre_circle = matplotlib.patches.Circle(
+                (0, 0), 0.70, fc=BG_COLOR
+            )
+            ax2.add_artist(centre_circle)
+            ax2.set_title("按专注目标累计时长分布", color="white")
+
+            canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_frame)
+            widget_pie = canvas_pie.get_tk_widget()
+            widget_pie.pack(fill="both", expand=True, padx=8, pady=8)
+            canvas_pie.draw()
+
+        # Bottom Right：最近 20 条历史记录
+        recent_records = list(reversed(records))[:20]
+        for ts_str, target, minutes in recent_records:
+            line = f"{ts_str}  |  {target or '—'}  |  {_format_duration(minutes)}\n"
+            history_box.insert("end", line)
+        history_box.see("end")
+        history_box.configure(state="disabled")
+
+    _refresh_statistics()
 
     root.mainloop()
 

@@ -30,6 +30,18 @@ BROWSER_PROCESSES = {
     "opera.exe",
 }
 
+# 系统级免死金牌（OS 级白名单），这些进程永不送入 LLM 审计，避免误杀核心系统组件
+OS_WHITELIST = {
+    "explorer.exe",
+    "taskmgr.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "cmd.exe",
+    "conhost.exe",
+    "python.exe",
+    "focus_guard.exe",
+}
+
 
 # 全局缓存：用于加速匹配（process_blacklist -> set, title_blacklist -> 预编译正则）
 _PROCESS_BLACKLIST_SET: Optional[set[str]] = None
@@ -288,41 +300,114 @@ def enforce_rules(
             _kill_processes_by_name(process_name or "")
         return
 
-    # 浏览器专属路径：在专注模式下，浏览器一律由 LLM 决策，静态标题规则完全失效
-    is_browser = bool(
-        process_name and process_name.lower() in BROWSER_PROCESSES
-    )
-    if is_browser and focus_target:
-        # 扩展还未上报任何 URL，或当前抓到的标题只是 URL 的一部分（典型 SPA 路由过渡期，标题尚未渲染出语义）
-        # 为避免在过渡期误杀，给予一轮加载宽限期，等待下一轮扩展上报真实中文/语义标题后再由 LLM 决策。
+    # 第二关：LLM 全场景智能审查（专注模式下，非 OS 白名单进程一律送入 LLM）
+    is_browser = bool(process_name and process_name.lower() in BROWSER_PROCESSES)
+    pn_lower = (process_name or "").lower()
+
+    if focus_target and pn_lower and pn_lower not in OS_WHITELIST:
+        # 浏览器宽限期：扩展尚未上报 URL 或标题只是 URL 片段（SPA 过渡期）→ 暂缓决策
         bt_lower = (browser_title or "").lower()
         bu_lower = (browser_url or "").lower()
-        if (not browser_url) or (bt_lower and bt_lower in bu_lower):
+        if is_browser and ((not browser_url) or (bt_lower and bt_lower in bu_lower)):
             print(
                 f"[FocusGuard] Browser title loading grace period: "
                 f"browser_title={browser_title!r}, url={browser_url!r}, focus_target={focus_target!r}"
             )
             return
 
+        # 统一调用 LLM 审计当前行为（本地应用或网页）
         try:
-            is_block = llm_classifier.evaluate_webpage_intent(
+            is_block = llm_classifier.evaluate_intent(
                 focus_target,
+                process_name or "",
                 browser_title or window_title or "",
                 browser_url,
             )
         except Exception as exc:
-            # LLM 调用任何异常都不影响后续逻辑；浏览器在专注模式下若无法得到明确裁决，则选择放行
-            print(f"[FocusGuard] LLM evaluation error for browser, allow by default: {exc}")
-            return
+            is_block = None
+            print(f"[FocusGuard] LLM API exception, degrading to static rules: {exc}")
 
-        if is_block:
-            # AI 判定为偏离目标 → 软阻断并优先返回
-            target_name = browser_title or window_title or (process_name or "受限内容")
+        if is_block is True:
+            # AI 判定为偏离目标 → 浏览器采用软阻断，本地应用采用硬阻断
+            if is_browser:
+                target_name = browser_title or window_title or (process_name or "受限内容")
 
-            def _ai_soft_block() -> None:
-                _send_ctrl_w_to_foreground()
+                def _ai_soft_block() -> None:
+                    _send_ctrl_w_to_foreground()
+                    try:
+                        name = (target_name or "").strip() or "未知页面"
+                        MB_ICONWARNING = 0x30
+                        MB_TOPMOST = 0x00040000
+                        MB_SETFOREGROUND = 0x00010000
+                        MB_SYSTEMMODAL = 0x00001000
+                        flags = (
+                            MB_ICONWARNING
+                            | MB_TOPMOST
+                            | MB_SETFOREGROUND
+                            | MB_SYSTEMMODAL
+                        )
+                        ctypes.windll.user32.MessageBoxW(
+                            None,
+                            f"[AI 护航拦截] 偏离目标：{name}",
+                            "FocusGuard 智能阻断",
+                            flags,
+                        )
+                    except Exception:
+                        # 弹窗异常不影响主逻辑
+                        return
+
+                threading.Thread(
+                    target=_ai_soft_block,
+                    daemon=True,
+                ).start()
+            else:
+                # 本地应用：使用 psutil 静默秒杀（不复用旧版通用 kill 辅助函数，以避免旧版警告弹窗叠加），并仅弹出 AI 护航专属提示
+                target_name = window_title or process_name or "受限应用"
+
+                # 静默硬阻断：优先按 PID 精准结束，失败时按进程名遍历结束；过程中不触发任何旧版 UI 提示
+                killed = False
+                if pid is not None and pid > 0:
+                    try:
+                        proc = psutil.Process(pid)
+                        name = proc.name()
+                        proc.kill()
+                        print(f"[FocusGuard] AI hard-kill local app by pid: {name} (pid={pid})")
+                        killed = True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        print(
+                            f"[FocusGuard] AI hard-kill by pid failed: pid={pid}, process={process_name}"
+                        )
+                    except Exception:
+                        print(
+                            f"[FocusGuard] Unexpected error during AI hard-kill by pid={pid}, process={process_name}"
+                        )
+
+                if not killed and process_name:
+                    target = process_name.lower()
+                    for proc in psutil.process_iter(attrs=["pid", "name"]):
+                        try:
+                            name = proc.info.get("name") or proc.name()
+                            if not name or name.lower() != target:
+                                continue
+                            try:
+                                proc.kill()
+                                print(
+                                    f"[FocusGuard] AI hard-kill local app by name: {name} (pid={proc.pid})"
+                                )
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                print(
+                                    f"[FocusGuard] AI hard-kill by name failed: {name} (pid={proc.pid})"
+                                )
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+                        except Exception:
+                            print(
+                                f"[FocusGuard] Unexpected error during AI hard-kill by name={process_name}"
+                            )
+
+                # 仅展示 AI 护航专属 UI 提示
                 try:
-                    name = (target_name or "").strip() or "未知页面"
+                    name = (target_name or "").strip() or "未知应用"
                     MB_ICONWARNING = 0x30
                     MB_TOPMOST = 0x00040000
                     MB_SETFOREGROUND = 0x00010000
@@ -335,26 +420,28 @@ def enforce_rules(
                     )
                     ctypes.windll.user32.MessageBoxW(
                         None,
-                        f"[AI 护航拦截] 偏离目标：{name}",
+                        f"[AI 护航拦截] 本地应用偏离目标：{name}",
                         "FocusGuard 智能阻断",
                         flags,
                     )
                 except Exception:
-                    # 弹窗异常不影响主逻辑
-                    return
+                    pass
 
-            threading.Thread(
-                target=_ai_soft_block,
-                daemon=True,
-            ).start()
             return
-
-        # LLM 明确放行：直接返回，浏览器不再进入静态标题规则
-        print(
-            f"[FocusGuard] LLM allow decision for browser, skip all static rules: "
-            f"target={focus_target!r}, browser_title={browser_title!r}, url={browser_url!r}"
-        )
-        return
+        elif is_block is False:
+            # LLM 明确判定放行：直接返回，跳过静态规则
+            print(
+                f"[FocusGuard] LLM explicitly allowed, skip static rules: "
+                f"target={focus_target!r}, process={process_name!r}, title={browser_title or window_title!r}, url={browser_url!r}"
+            )
+            return
+        elif is_block is None:
+            # LLM 不可用（超时/解析错误/结构异常），降级到静态标题规则兜底
+            print(
+                f"[FocusGuard] LLM unavailable, falling back to static title rules: "
+                f"target={focus_target!r}, process={process_name!r}, title={browser_title or window_title!r}, url={browser_url!r}"
+            )
+            # 不 return，由后续“第三关：静态规则兜底”继续处理
 
     # 第三关：静态规则兜底（仅非浏览器场景或无专注目标时生效）
     if not matched_title:
