@@ -192,6 +192,22 @@ def load_config() -> Dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as f:
         data: Dict[str, Any] = json.load(f)
 
+    # 确保 os_whitelist 字段存在，并提供安全默认值，防止配置被误删导致异常
+    default_os_whitelist = [
+        "explorer.exe",
+        "taskmgr.exe",
+        "searchhost.exe",
+        "cmd.exe",
+        "python.exe",
+        "focus_guard.exe",
+        "anydesk.exe",
+        "todesk.exe",
+    ]
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("os_whitelist"), list):
+        data["os_whitelist"] = default_os_whitelist
+
     return data
 
 

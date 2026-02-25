@@ -57,21 +57,26 @@ browser_extension/
 
 核心方法： `enforce_rules(process_name, window_title, pid, config, browser_url="", browser_title="", focus_target="")`
 
-当前阻断引擎采用 **三级容灾拦截架构**：
+当前阻断引擎采用 **多层容灾拦截架构**：
+
+- **Level 0：系统免疫白名单特权放行**
+  - 在进入 LLM 审计与静态规则之前，阻断模块会从 `config.json` 中读取 `os_whitelist` 列表（若缺失则回退到一组安全默认值，如 `explorer.exe`, `taskmgr.exe`, `python.exe`, `focus_guard.exe`, `anydesk.exe`, `todesk.exe` 等）。
+  - 若当前前台进程名命中该白名单，则打印 `[FocusGuard] Process in OS Whitelist, allowed.` 日志并直接 return 放行，确保系统核心与远程控制等基建设施在任何情况下都不会被误杀。
 
 - **Level 1：进程名强力秒杀（本地极速拦截）**
   - 根据 `process_blacklist` 精确匹配当前前台窗口进程名。
   - 命中后优先按 PID 精准 `kill()` 对应进程，失败再回退为按进程名遍历所有同名进程并逐一结束。
   - 通过系统原生 `MessageBoxW` 弹窗提示用户已拦截受限应用，构成第一道物理防线。
 
-- **Level 2：AI 智能裁决（浏览器与未来全局桌面场景）**
-  - 当前台进程为浏览器且存在专注目标 `focus_target` 时，阻断引擎优先走 LLM 路径：
-    - 从本地 HTTP 服务中获取 `browser_title` 与 `browser_url`。
-    - 将“专注目标 + 网页标题 + URL”送入 `llm_classifier.evaluate_webpage_intent`，得到三态结果：
-      - `True`  → 触发 AI 软阻断（模拟 `Ctrl+W` 关闭当前标签页，并弹出 `[AI 护航拦截] 偏离目标：xxx` 提示）。
+- **Level 2：AI 智能裁决（浏览器与全局桌面场景）**
+  - 在存在专注目标 `focus_target` 且当前进程不在 OS 白名单时，阻断引擎优先走 LLM 路径：
+    - 对浏览器进程：从本地 HTTP 服务中获取 `browser_title` 与 `browser_url`，并在 URL/标题尚未就绪（入口与 SPA 过渡期）时暂缓决策，等待下一轮再送入 LLM。
+    - 对本地应用：直接使用“专注目标 + 进程名 + 窗口标题”的组合送入 `llm_classifier.evaluate_intent`。
+    - LLM 返回三态结果：
+      - `True`  → 浏览器触发软阻断（模拟 `Ctrl+W` + “[AI 护航拦截] 偏离目标：xxx”）；本地应用执行 psutil 静默硬 kill，仅弹出 “[AI 护航拦截] 本地应用偏离目标：{窗口标题或进程名}” 的专属提示。
       - `False` → 视为 LLM 明确放行，当前请求跳过所有静态规则，直接通过。
       - `None`  → 视为 LLM 不可用（网络超时/解析异常/结构异常），不做主动决策，降级到 Level 3 静态规则兜底。
-  - LLM 路径自带本地缓存（按“专注目标 | URL”键控）、入口与 SPA 标题宽限期、以及超时降级逻辑，确保“网络好时 AI 精准护航，网络卡时老规则稳如老狗”。
+  - LLM 路径自带本地缓存（按“专注目标 | 进程名 | 窗口标题 | URL”键控）、入口与 SPA 标题宽限期、以及超时降级逻辑，确保“网络好时 AI 精准护航，网络卡时老规则稳如老狗”。
 
 - **Level 3：静态规则兜底**
   - 无论是否有浏览器扩展与 LLM，只要命中 `title_blacklist`（窗口标题 / 浏览器标题 / URL），在非浏览器或 LLM 不可用的场景下，都会触发静态兜底逻辑：

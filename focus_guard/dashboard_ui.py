@@ -46,7 +46,20 @@ except ImportError:
 
 # 与 dashboard_ui.py 同目录的 config.json
 _CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
-_DEFAULT_CONFIG: Dict[str, List[str]] = {"process_blacklist": [], "title_blacklist": []}
+_DEFAULT_CONFIG: Dict[str, List[str]] = {
+    "process_blacklist": [],
+    "title_blacklist": [],
+    "os_whitelist": [
+        "explorer.exe",
+        "taskmgr.exe",
+        "searchhost.exe",
+        "cmd.exe",
+        "python.exe",
+        "focus_guard.exe",
+        "anydesk.exe",
+        "todesk.exe",
+    ],
+}
 
 
 def load_config() -> Dict[str, Any]:
@@ -55,22 +68,27 @@ def load_config() -> Dict[str, Any]:
     若文件不存在或为空，返回默认结构 {"process_blacklist": [], "title_blacklist": []}。
     """
     if not _CONFIG_PATH.exists():
-        return {"process_blacklist": [], "title_blacklist": []}
+        return dict(_DEFAULT_CONFIG)
     try:
         with _CONFIG_PATH.open("r", encoding="utf-8") as f:
             raw = f.read().strip()
         if not raw:
-            return {"process_blacklist": [], "title_blacklist": []}
+            return dict(_DEFAULT_CONFIG)
         data = json.loads(raw)
         if not isinstance(data, dict):
-            return {"process_blacklist": [], "title_blacklist": []}
+            return dict(_DEFAULT_CONFIG)
+        # 兼容老配置文件，补全缺失字段
         return {
             "process_blacklist": list(data.get("process_blacklist") or []),
             "title_blacklist": list(data.get("title_blacklist") or []),
+            "os_whitelist": list(
+                data.get("os_whitelist")
+                or _DEFAULT_CONFIG["os_whitelist"]
+            ),
         }
     except Exception as e:
         print(f"[FocusGuard] load_config error: {e}")
-        return {"process_blacklist": [], "title_blacklist": []}
+        return dict(_DEFAULT_CONFIG)
 
 
 def save_config(config_data: Dict[str, Any]) -> None:
@@ -454,7 +472,7 @@ def run_dashboard() -> None:
     )
     custom_start_btn.pack(side="left", padx=(0, 4), pady=8, fill="x", expand=True)
 
-    # Tab 2: 规则库 (Blacklist)
+    # Tab 2: 规则库 (Blacklist + OS 白名单)
     blacklist_tab = tabview.add("规则库")
     # 内存中的配置，与 config.json 同步
     config_data: Dict[str, List[str]] = load_config()
@@ -462,10 +480,20 @@ def run_dashboard() -> None:
         config_data["process_blacklist"] = []
     if not isinstance(config_data.get("title_blacklist"), list):
         config_data["title_blacklist"] = []
+    if not isinstance(config_data.get("os_whitelist"), list):
+        config_data["os_whitelist"] = _DEFAULT_CONFIG["os_whitelist"][:]
 
-    # ---------- 左侧：进程黑名单 ----------
-    left_frame = ctk.CTkFrame(blacklist_tab)
-    left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+    # 规则库内再引入 TabView，分为三类规则
+    rules_tabview = ctk.CTkTabview(blacklist_tab)
+    rules_tabview.pack(fill="both", expand=True, padx=8, pady=8)
+
+    process_tab = rules_tabview.add("进程黑名单")
+    title_tab = rules_tabview.add("标题黑名单")
+    os_tab = rules_tabview.add("系统免疫白名单")
+
+    # ---------- 进程黑名单 Tab ----------
+    left_frame = ctk.CTkFrame(process_tab)
+    left_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     ctk.CTkLabel(
         left_frame,
@@ -646,9 +674,9 @@ def run_dashboard() -> None:
         command=open_smart_picker,
     ).pack(fill="x", padx=12, pady=(0, 12))
 
-    # ---------- 右侧：标题黑名单 ----------
-    right_frame = ctk.CTkFrame(blacklist_tab)
-    right_frame.pack(side="right", fill="both", expand=True, padx=(8, 0), pady=8)
+    # ---------- 标题黑名单 Tab ----------
+    right_frame = ctk.CTkFrame(title_tab)
+    right_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     ctk.CTkLabel(
         right_frame,
@@ -716,6 +744,78 @@ def run_dashboard() -> None:
             ).pack(side="right", padx=8, pady=4)
 
     refresh_title_list()
+
+    # ---------- 系统免疫白名单 Tab ----------
+    os_frame = ctk.CTkFrame(os_tab)
+    os_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+    ctk.CTkLabel(
+        os_frame,
+        text="系统免疫白名单（不会交给 AI 审计的系统/基础进程）",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        anchor="w",
+    ).pack(fill="x", padx=12, pady=(12, 8))
+
+    os_add_row = ctk.CTkFrame(os_frame)
+    os_add_row.pack(fill="x", padx=12, pady=(0, 8))
+
+    os_entry = ctk.CTkEntry(
+        os_add_row,
+        placeholder_text="输入进程名，如 todesk.exe",
+        font=ctk.CTkFont(size=11),
+        height=32,
+    )
+    os_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    os_scroll = ctk.CTkScrollableFrame(os_frame)
+    os_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    def refresh_os_whitelist() -> None:
+        for w in os_scroll.winfo_children():
+            w.destroy()
+        for name in config_data["os_whitelist"]:
+            row = ctk.CTkFrame(os_scroll)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row, text=name, font=ctk.CTkFont(size=11), anchor="w"
+            ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
+
+            def _remove_os(proc: str) -> None:
+                if proc in config_data["os_whitelist"]:
+                    config_data["os_whitelist"].remove(proc)
+                    save_config(config_data)
+                    refresh_os_whitelist()
+
+            ctk.CTkButton(
+                row,
+                text="删除",
+                width=60,
+                height=28,
+                fg_color=("#c0392b", "#a93226"),
+                hover_color=("#e74c3c", "#cb4335"),
+                command=lambda p=name: _remove_os(p),
+            ).pack(side="right", padx=8, pady=4)
+
+    def add_os_entry() -> None:
+        name = os_entry.get().strip()
+        if not name:
+            return
+        key = name.lower()
+        if key not in config_data["os_whitelist"]:
+            config_data["os_whitelist"].append(key)
+            save_config(config_data)
+            refresh_os_whitelist()
+        os_entry.delete(0, "end")
+
+    ctk.CTkButton(
+        os_add_row,
+        text="添加",
+        width=70,
+        height=32,
+        command=add_os_entry,
+    ).pack(side="left")
+
+    refresh_os_whitelist()
 
     def open_title_picker() -> None:
         # 从本地 FocusGuard HTTP 服务获取最近浏览器标签页特征

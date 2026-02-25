@@ -30,16 +30,15 @@ BROWSER_PROCESSES = {
     "opera.exe",
 }
 
-# 系统级免死金牌（OS 级白名单），这些进程永不送入 LLM 审计，避免误杀核心系统组件
-OS_WHITELIST = {
+DEFAULT_OS_WHITELIST = {
     "explorer.exe",
     "taskmgr.exe",
     "searchhost.exe",
-    "shellexperiencehost.exe",
     "cmd.exe",
-    "conhost.exe",
     "python.exe",
     "focus_guard.exe",
+    "anydesk.exe",
+    "todesk.exe",
 }
 
 
@@ -304,7 +303,20 @@ def enforce_rules(
     is_browser = bool(process_name and process_name.lower() in BROWSER_PROCESSES)
     pn_lower = (process_name or "").lower()
 
-    if focus_target and pn_lower and pn_lower not in OS_WHITELIST:
+    # 动态系统免疫白名单：从 config.json 读取 os_whitelist 字段，若缺失则回退到 DEFAULT_OS_WHITELIST
+    raw_whitelist = config.get("os_whitelist")
+    if isinstance(raw_whitelist, list):
+        os_whitelist_set = {str(x).lower() for x in raw_whitelist}
+    else:
+        os_whitelist_set = set(DEFAULT_OS_WHITELIST)
+
+    if focus_target and pn_lower:
+        if pn_lower in os_whitelist_set:
+            print(
+                f"[FocusGuard] Process in OS Whitelist, allowed: process={process_name!r}"
+            )
+            return
+
         # 浏览器宽限期：扩展尚未上报 URL 或标题只是 URL 片段（SPA 过渡期）→ 暂缓决策
         bt_lower = (browser_title or "").lower()
         bu_lower = (browser_url or "").lower()
