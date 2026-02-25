@@ -1,0 +1,7 @@
+customtkinter
+psutil
+pystray
+Pillow
+pywin32
+matplotlib
+
